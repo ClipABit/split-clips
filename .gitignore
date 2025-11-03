@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.log
+*.tmp
+tmp/
+outputs/
+*.mp4
+*.mkv
+*.webm
+.DS_Store
