@@ -47,6 +47,15 @@ min_scene_len = st.sidebar.number_input("Minimum scene length (seconds)", min_va
 start = st.sidebar.number_input("Start offset (seconds)", min_value=0.0, value=0.0, step=0.5)
 max_duration = st.sidebar.number_input("Max analyze duration (seconds, 0 = full)", min_value=0.0, value=0.0, step=1.0)
 do_dry_run = st.sidebar.checkbox("Dry run (no clip export)", value=False)
+min_export_len = st.sidebar.number_input(
+    "Drop clips shorter than (seconds)",
+    min_value=0.0,
+    max_value=60.0,
+    value=0.0,
+    step=0.5,
+    help="Any detected scene shorter than this will not be exported."
+)
+
 
 out_root = Path("outputs")
 st.sidebar.write("---")
@@ -83,8 +92,21 @@ def process_video():
             st.success(f"Downloaded: {video_path.name}")
 
         st.write("**[2/3] Detecting scenes…**")
-        scenes, video = detect_scenes(video_path, detector, threshold, min_scene_len, start, max_duration)
-        st.info(f"Found **{len(scenes)}** scenes")
+        scenes, video = detect_scenes(
+            video_path,
+            detector,
+            threshold,
+            min_scene_len,
+            start,
+            max_duration,
+        )
+
+        # Apply min_export_len in seconds
+        from scene_slicer import filter_short_scenes
+        if min_export_len > 0:
+            scenes = filter_short_scenes(scenes, min_export_len)
+
+        st.info(f"Found **{len(scenes)}** scenes after filtering")
 
         base_out = out_root / video_id
         scenes_dir = base_out / "scenes"
@@ -93,8 +115,16 @@ def process_video():
         st.write("**[3/3] Exporting clips…**")
         outputs = export_scenes_ffmpeg(video_path, scenes, scenes_dir, prefix="scene_", dry_run=do_dry_run)
 
-        # Write manifest after export using real filenames (if not dry-run)
-        manifest_csv = write_manifest(scenes, base_out, base_prefix="scene_", file_names=(outputs if not do_dry_run else None))
+        manifest_csv = write_manifest(
+            scenes,
+            base_out,
+            base_prefix="scene_",
+            file_names=(outputs if not do_dry_run else None),
+        )
+
+        st.session_state.clip_paths = outputs if not do_dry_run else []
+
+
 
         # Load manifest to display
         import csv
@@ -119,25 +149,30 @@ if run_btn:
         process_video()
 
 # --- Results section ---
-if st.session_state.manifest_df is not None:
-    st.subheader("Scenes")
-    st.dataframe(st.session_state.manifest_df, use_container_width=True)
+if (
+    st.session_state.manifest_df is not None
+    and not do_dry_run
+    and st.session_state.get("clip_paths")
+):
+    st.subheader("Download scenes")
 
-    # Download ZIP of scenes
-    if st.session_state.last_output_dir is not None and not do_dry_run:
-        scenes_path = st.session_state.last_output_dir / "scenes"
-        zip_name = f"{st.session_state.video_id}_scenes.zip"
-        zip_path = st.session_state.last_output_dir / zip_name
+    import zipfile, io, os
 
-        if scenes_path.exists():
-            # Build zip on demand
-            import zipfile, io
-            mem = io.BytesIO()
-            with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
-                for f in sorted(scenes_path.iterdir()):
-                    if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".webm", ".mov"]:
-                        z.write(f, arcname=f.name)
-            st.download_button("⬇️ Download Scenes ZIP", data=mem.getvalue(), file_name=zip_name, mime="application/zip")
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        for full_path in st.session_state.clip_paths:
+            p = Path(full_path)
+            if p.is_file():
+                # arcname = filename only, so ZIP is clean
+                z.write(p, arcname=p.name)
+
+    zip_name = f"{st.session_state.video_id}_scenes.zip"
+    st.download_button(
+        "⬇️ Download Scenes ZIP",
+        data=mem.getvalue(),
+        file_name=zip_name,
+        mime="application/zip",
+    )
 
     # Show where files are saved
     st.caption(f"Output folder: `{st.session_state.last_output_dir}`")

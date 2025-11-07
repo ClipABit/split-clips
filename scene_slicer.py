@@ -37,8 +37,6 @@ def download_youtube(url: str, tmpdir: Path, cookies_from_browser: Optional[str]
     YouTube SABR/nsig changes by trying multiple player clients and optional browser cookies.
     Returns (filepath, video_id).
     """
-    # Try a few client profiles that are less likely to hit SABR-restricted formats.
-    client_candidates = ["android", "tvhtml5", "web"]
     last_err = None
 
     # Optional cookies-from-browser (e.g., "chrome", "edge", "firefox" or "chrome:Profile 1")
@@ -47,36 +45,31 @@ def download_youtube(url: str, tmpdir: Path, cookies_from_browser: Optional[str]
         parts = [s.strip() for s in cookies_from_browser.split(":", 1)]
         cfb = tuple(parts) if len(parts) == 2 else (parts[0],)
 
-    for client in client_candidates:
-        ydl_opts = {
-            "outtmpl": str(tmpdir / "%(id)s.%(ext)s"),
-            "format": "bv*+ba/b",   # best video+audio, else best single
-            "merge_output_format": "mp4",
-            "noprogress": True,
-            "quiet": True,
-            "restrictfilenames": True,
-            "retries": 10,
-            "concurrent_fragment_downloads": 5,
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
-            "extractor_args": {"youtube": {"player_client": [client]}},
-        }
-        if cfb:
-            ydl_opts["cookiesfrombrowser"] = cfb
+    ydl_opts = {
+        "outtmpl": str(tmpdir / "%(id)s.%(ext)s"),
+        "format": "bv*+ba/b",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "retries": 10,
+        "concurrent_fragment_downloads": 5,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+    }
+    if cfb:
+        ydl_opts["cookiesfrombrowser"] = cfb
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                vid_id = info.get("id", "video")
-                ext = info.get("ext", "mp4")
-                file_path = tmpdir / f"{vid_id}.{ext}"
-                if not file_path.exists():
-                    # sometimes yt-dlp remuxes to mp4
-                    alt = tmpdir / f"{vid_id}.mp4"
-                    file_path = alt if alt.exists() else file_path
-                return file_path, vid_id
-        except Exception as e:
-            last_err = e
-            continue  # try the next client
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            vid_id = info.get("id", "video")
+            ext = info.get("ext", "mp4")
+            file_path = tmpdir / f"{vid_id}.{ext}"
+            if not file_path.exists():
+                # sometimes yt-dlp remuxes to mp4
+                alt = tmpdir / f"{vid_id}.mp4"
+                file_path = alt if alt.exists() else file_path
+            return file_path, vid_id
+    except Exception as e:
+        last_err = e
 
     # If all clients failed, raise the last error for visibility
     raise last_err
@@ -117,20 +110,49 @@ def detect_scenes(video_path: Path, detector: str, threshold: float, min_scene_l
     scene_list = sm.get_scene_list()
     return scene_list, video
 
-
-
-def export_scenes_ffmpeg(video_path: Path, scenes, out_dir: Path, prefix="scene_", dry_run=False):
+def filter_short_scenes(scene_list, min_len_sec: float):
     """
-    Export scenes by invoking ffmpeg directly. This avoids API/template differences across
-    PySceneDetect versions and guarantees filenames match the manifest.
-    Returns a list of output file names (basename only).
+    Return only scenes whose duration is >= min_len_sec.
+    scene_list: list of (start_time, end_time) where values are PySceneDetect Timecode objects.
+    """
+    if not scene_list or min_len_sec <= 0:
+        return scene_list
+
+    kept = []
+    for start, end in scene_list:
+        # PySceneDetect Timecode has get_seconds()
+        start_sec = start.get_seconds()
+        end_sec = end.get_seconds()
+        if end_sec - start_sec >= min_len_sec:
+            kept.append((start, end))
+    return kept
+
+
+def export_scenes_ffmpeg(
+    video_path: Path,
+    scenes,
+    out_dir: Path,
+    prefix: str = "scene_",
+    dry_run: bool = False,
+    force_reencode: bool = False,
+    crf: int = 18,
+    preset: str = "slow",
+):
+    """
+    Export scenes to individual clips using ffmpeg.
+
+    - If force_reencode == False:
+        Try stream copy (-c copy) first (no quality loss, very fast).
+        If that fails (e.g., cut not on keyframe), fall back to high-quality re-encode.
+    - If force_reencode == True:
+        Always re-encode with libx264/aac using given CRF & preset.
+    - Returns: list of full file paths for the exported clips.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs = []
+
     if dry_run:
         return outputs
-
-    import subprocess
 
     def tc_seconds(tc):
         return tc.get_seconds() if hasattr(tc, "get_seconds") else float(tc)
@@ -139,34 +161,60 @@ def export_scenes_ffmpeg(video_path: Path, scenes, out_dir: Path, prefix="scene_
         start_sec = tc_seconds(start_tc)
         end_sec = tc_seconds(end_tc)
         duration = max(0.001, end_sec - start_sec)
+
         out_name = f"{prefix}{idx:04d}__{human_timecode(start_sec)}__{human_timecode(end_sec)}.mp4"
         out_file = out_dir / out_name
 
-        # -ss before -i for fast seek; -to is duration when paired this way
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", f"{start_sec:.3f}",
-            "-i", str(video_path),
-            "-to", f"{duration:.3f}",
-            "-c", "copy",
-            str(out_file),
-        ]
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError:
-            # Fallback to re-encode if copy fails (e.g., cuts between non-keyframes)
+        if force_reencode:
+            # Single high-quality encode path.
             cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "ffmpeg",
+                "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", f"{start_sec:.3f}",
                 "-i", str(video_path),
                 "-to", f"{duration:.3f}",
                 "-c:v", "libx264",
+                "-preset", str(preset),
+                "-crf", str(crf),
                 "-c:a", "aac",
                 "-movflags", "+faststart",
                 str(out_file),
             ]
             subprocess.run(cmd, check=True)
-        outputs.append(out_name)
+        else:
+            # 1) Try lossless/fast stream copy
+            copy_cmd = [
+                "ffmpeg",
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{start_sec:.3f}",
+                "-i", str(video_path),
+                "-to", f"{duration:.3f}",
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(out_file),
+            ]
+            result = subprocess.run(copy_cmd)
+            if result.returncode != 0 or not out_file.exists() or out_file.stat().st_size == 0:
+                # 2) Fallback: high-quality re-encode
+                if out_file.exists():
+                    out_file.unlink(missing_ok=True)
+                reenc_cmd = [
+                    "ffmpeg",
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", f"{start_sec:.3f}",
+                    "-i", str(video_path),
+                    "-to", f"{duration:.3f}",
+                    "-c:v", "libx264",
+                    "-preset", str(preset),
+                    "-crf", str(crf),
+                    "-c:a", "aac",
+                    "-movflags", "+faststart",
+                    str(out_file),
+                ]
+                subprocess.run(reenc_cmd, check=True)
+
+        outputs.append(str(out_file))
+
     return outputs
 
 def write_manifest(scenes, out_dir: Path, base_prefix="scene_", file_names=None):
@@ -200,49 +248,94 @@ def main():
     parser.add_argument("--max-duration", type=float, default=0.0, help="Max duration to analyze (0 = full video)")
     parser.add_argument("--dry-run", action="store_true", help="Only detect & print; do not export scenes")
     parser.add_argument("--keep-temp", action="store_true", help="Keep downloaded file in tmp dir")
-    parser.add_argument("--cookies-from-browser", type=str, default=None, help="Use browser cookies (e.g., chrome | edge | firefox or chrome:Profile 1)")
+    parser.add_argument(
+        "--cookies-from-browser",
+        type=str,
+        default=None,
+        help="Use browser cookies (e.g., chrome | edge | firefox or chrome:Profile 1)",
+    )
+    parser.add_argument(
+        "--min-export-len",
+        type=float,
+        default=0.0,
+        help="Drop scenes shorter than this many seconds from final output (default: 0 = keep all).",
+    )
+    parser.add_argument(
+        "--force-reencode",
+        action="store_true",
+        help="Always re-encode clips with x264/aac instead of trying stream copy.",
+    )
+
     args = parser.parse_args()
 
     ensure_ffmpeg()
 
     tmpdir = Path(tempfile.mkdtemp(prefix="scene_slicer_"))
-    download_path = None
     video_id = "localfile"
 
     try:
+        # 1) Resolve input (local vs YouTube)
         input_path = Path(args.input)
         if input_path.exists():
             video_path = input_path
+            video_id = sanitize(input_path.stem)
+            print(f"[1/3] Using local file: {video_path}")
         else:
             print("[1/3] Downloading…")
-            video_path, video_id = download_youtube(args.input, tmpdir, cookies_from_browser=args.cookies_from_browser)
+            video_path, video_id = download_youtube(
+                args.input,
+                tmpdir,
+                cookies_from_browser=args.cookies_from_browser,
+            )
             print(f"    saved: {video_path.name}")
 
+        # 2) Detect scenes
         print("[2/3] Detecting scenes…")
-        scenes, video = detect_scenes(video_path, args.detector, args.threshold, args.min_scene_len, args.start, args.max_duration)
-        print(f"    found {len(scenes)} scenes")
+        scenes, video = detect_scenes(
+            video_path=video_path,
+            detector=args.detector,
+            threshold=args.threshold,
+            min_scene_len=args.min_scene_len,
+            start=args.start,
+            max_duration=args.max_duration,
+        )
+        print(f"    found {len(scenes)} raw scenes")
 
-        # Prepare output folders
+        # 3) Filter short scenes (seconds-based)
+        if args.min_export_len > 0:
+            scenes = filter_short_scenes(scenes, args.min_export_len)
+            print(f"    after filtering < {args.min_export_len:.2f}s: {len(scenes)} scenes")
+
+        if not scenes:
+            print("No scenes to export after filtering. Exiting.")
+            return
+
+        # 4) Prepare output dirs
         base_out = Path(args.output_dir) / video_id
         scenes_dir = base_out / "scenes"
         base_out.mkdir(parents=True, exist_ok=True)
 
-        # Write manifest CSV
-        # Export
+        # 5) Export
         print("[3/3] Exporting clips…")
-        outputs = export_scenes_ffmpeg(video_path, scenes, scenes_dir, prefix="scene_", dry_run=args.dry_run)
+        clips = export_scenes_ffmpeg(
+            video_path,
+            scenes,
+            scenes_dir,
+            prefix="scene_",
+            dry_run=args.dry_run,
+            force_reencode=args.force_reencode,
+        )
+        print(f"    Exported {len(clips)} clips → {scenes_dir}")
 
-        # Write manifest CSV after export, using actual filenames to ensure a match.
-        manifest_csv = write_manifest(scenes, base_out, base_prefix="scene_", file_names=outputs if not args.dry_run else None)
-        print(f"    wrote: {manifest_csv}")
-
+        # 6) Manifest
         if not args.dry_run:
-            print(f"    clips: {scenes_dir}")
+            manifest_csv = write_manifest(scenes, base_out, base_prefix="scene_")
+            print(f"    Wrote manifest: {manifest_csv}")
 
-        print("Done.")
     finally:
         if not args.keep_temp:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     main()

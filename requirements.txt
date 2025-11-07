@@ -2,6 +2,5 @@ yt-dlp>=2024.8.6
 scenedetect[opencv]>=0.6.3
 opencv-python>=4.8.0.76
 tqdm>=4.66.1
-
 streamlit>=1.38.0
 pandas>=2.2.0
