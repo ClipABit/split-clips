@@ -1,4 +1,4 @@
-# scene-slicer
+# split-clips
 
 Split any YouTube video (trailer, music video, movie clip) into **scenes** automatically.
 
