@@ -16,7 +16,7 @@ Split any YouTube video (trailer, music video, movie clip) into **scenes** autom
 ## Quickstart (local)
 
 ### 0) Prereqs
-- Python 3.9+
+- Python 3.12
 - `ffmpeg` on PATH (macOS `brew install ffmpeg`, Ubuntu `sudo apt-get install ffmpeg`, Windows via [ffmpeg.org] downloads)
 
 ### 1) Install
@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 ### 2) Run
 ```bash
-python scene_slicer.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -o outputs/demo   --threshold 27 --min-scene-len 0.8
+python scene_slicer.py "https://www.youtube.com/watch?v=q7dKevkSFdc" -o outputs --threshold 27 --min-export-len 30
 ```
 
 This will:

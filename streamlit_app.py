@@ -6,7 +6,6 @@ import shutil
 import pandas as pd
 from typing import Optional, Tuple
 
-# Import functions from the CLI module
 from scene_slicer import (
     ensure_ffmpeg,
     download_youtube,
@@ -17,7 +16,6 @@ from scene_slicer import (
 )
 
 st.set_page_config(page_title="Scene Slicer", page_icon="🎬", layout="wide")
-
 st.title("🎬 Scene Slicer")
 st.caption("Download a YouTube video (or use a local file) and split it into scenes.")
 
@@ -43,37 +41,36 @@ else:
 
 detector = st.sidebar.selectbox("Detector", options=["content", "adaptive", "histogram"], index=0)
 threshold = st.sidebar.slider("Threshold (higher = fewer cuts)", min_value=5, max_value=60, value=27, step=1)
-min_scene_len = st.sidebar.number_input("Minimum scene length (seconds)", min_value=0.1, max_value=10.0, value=0.6, step=0.1)
 start = st.sidebar.number_input("Start offset (seconds)", min_value=0.0, value=0.0, step=0.5)
 max_duration = st.sidebar.number_input("Max analyze duration (seconds, 0 = full)", min_value=0.0, value=0.0, step=1.0)
 do_dry_run = st.sidebar.checkbox("Dry run (no clip export)", value=False)
 min_export_len = st.sidebar.number_input(
     "Drop clips shorter than (seconds)",
     min_value=0.0,
-    max_value=60.0,
-    value=0.0,
+    value=30.0,
     step=0.5,
-    help="Any detected scene shorter than this will not be exported."
+    help="Any detected scene shorter than this will not be exported.",
 )
-
 
 out_root = Path("outputs")
 st.sidebar.write("---")
 run_btn = st.sidebar.button("▶️ Run Scene Slicing", type="primary")
 
-# Session state for results
+# Session state
 if "last_output_dir" not in st.session_state:
     st.session_state.last_output_dir = None
 if "manifest_df" not in st.session_state:
     st.session_state.manifest_df = None
 if "video_id" not in st.session_state:
     st.session_state.video_id = None
+if "clip_paths" not in st.session_state:
+    st.session_state.clip_paths = []
 
 def process_video():
     ensure_ffmpeg()
     tmpdir = Path(tempfile.mkdtemp(prefix="scene_slicer_ui_"))
     try:
-        # Determine source video
+        # Source
         if input_mode == "Local File":
             if not uploaded_file:
                 st.error("Please upload a local video file.")
@@ -93,62 +90,56 @@ def process_video():
 
         st.write("**[2/3] Detecting scenes…**")
         scenes, video = detect_scenes(
-            video_path,
-            detector,
-            threshold,
-            min_scene_len,
-            start,
-            max_duration,
+            video_path=video_path,
+            detector=detector,
+            threshold=threshold,
+            start=start,
+            max_duration=max_duration,
+            min_scene_len=min_export_len
         )
-
-        # Apply min_export_len in seconds
-        from scene_slicer import filter_short_scenes
-        if min_export_len > 0:
-            scenes = filter_short_scenes(scenes, min_export_len)
-
-        st.info(f"Found **{len(scenes)}** scenes after filtering")
+        st.info(f"Detected **{len(scenes)}** raw scenes")
 
         base_out = out_root / video_id
         scenes_dir = base_out / "scenes"
         base_out.mkdir(parents=True, exist_ok=True)
 
         st.write("**[3/3] Exporting clips…**")
-        outputs = export_scenes_ffmpeg(video_path, scenes, scenes_dir, prefix="scene_", dry_run=do_dry_run)
-
-        manifest_csv = write_manifest(
+        outputs, kept_scenes = export_scenes_ffmpeg(
+            video_path,
             scenes,
-            base_out,
-            base_prefix="scene_",
-            file_names=(outputs if not do_dry_run else None),
+            scenes_dir,
+            prefix="scene_",
+            dry_run=do_dry_run,
+            min_export_len=min_export_len,   # <- filter applied here
         )
 
+        if not do_dry_run:
+            manifest_csv = write_manifest(kept_scenes, base_out, base_prefix="scene_")
+
+            # Load manifest
+            import csv
+            rows = []
+            with open(manifest_csv, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                headers = next(reader)
+                for row in reader:
+                    rows.append(row)
+            df = pd.DataFrame(rows, columns=["scene_number", "start_sec", "end_sec", "duration_sec", "output_file"])
+            st.session_state.manifest_df = df
+
         st.session_state.clip_paths = outputs if not do_dry_run else []
-
-
-
-        # Load manifest to display
-        import csv
-        rows = []
-        with open(manifest_csv, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i == 0:
-                    headers = next(csv.reader([line]))
-                else:
-                    rows.append(next(csv.reader([line])))
-        df = pd.DataFrame(rows, columns=["scene_number", "start_sec", "end_sec", "duration_sec", "output_file"])
-        st.session_state.manifest_df = df
         st.session_state.last_output_dir = base_out
         st.session_state.video_id = video_id
 
-        st.success("Done!")
+        st.success(f"Done! Exported {len(outputs)} scenes ≥ {min_export_len:.2f}s.")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 if run_btn:
-    with st.spinner("Processing… this can take a moment"):
+    with st.spinner("Processing…"):
         process_video()
 
-# --- Results section ---
+# --- Results
 if (
     st.session_state.manifest_df is not None
     and not do_dry_run
@@ -156,14 +147,12 @@ if (
 ):
     st.subheader("Download scenes")
 
-    import zipfile, io, os
-
+    import zipfile, io
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
         for full_path in st.session_state.clip_paths:
             p = Path(full_path)
             if p.is_file():
-                # arcname = filename only, so ZIP is clean
                 z.write(p, arcname=p.name)
 
     zip_name = f"{st.session_state.video_id}_scenes.zip"
@@ -174,5 +163,4 @@ if (
         mime="application/zip",
     )
 
-    # Show where files are saved
     st.caption(f"Output folder: `{st.session_state.last_output_dir}`")
