@@ -1,4 +1,4 @@
-# scene-slicer
+# split-clips
 
 Split any YouTube video (trailer, music video, movie clip) into **scenes** automatically.
 
@@ -72,26 +72,6 @@ scene-slicer/
   ├─ LICENSE
   └─ .gitignore
 ```
-
----
-
-## Create & publish the repo (GitHub CLI)
-
-```bash
-# inside the scene-slicer folder
-git init
-git add .
-git commit -m "feat: initial scene slicer"
-# replace ORG with your GitHub org name
-gh repo create ORG/scene-slicer --public --source=. --remote=origin --push
-```
-If you don’t use `gh`, create the repo in the org UI and then:
-```bash
-git remote add origin https://github.com/ORG/scene-slicer.git
-git push -u origin main
-```
-
----
 
 ## Notes
 - For noisy music videos, try `--threshold 32` or `--detector adaptive`.
