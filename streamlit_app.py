@@ -2,28 +2,18 @@
 import streamlit as st
 from pathlib import Path
 import tempfile
-import shutil
+import gc
+import time
 import pandas as pd
 from typing import Optional, Tuple
 
-from scene_slicer import (
-    ensure_ffmpeg,
-    download_youtube,
-    detect_scenes,
-    export_scenes_ffmpeg,
-    write_manifest,
-    human_timecode,
-)
+from scene_slicer import SceneSlicer
 
 st.set_page_config(page_title="Scene Slicer", page_icon="🎬", layout="wide")
 st.title("🎬 Scene Slicer")
 st.caption("Download a YouTube video (or use a local file) and split it into scenes.")
 
-with st.expander("⚠️ Usage & Terms", expanded=False):
-    st.write(
-        "- Only download/process videos where you have rights/permission.\n"
-        "- Respect YouTube and content providers' Terms of Service and copyright.\n"
-    )
+slicer = SceneSlicer()
 
 # --- Sidebar options ---
 st.sidebar.header("Options")
@@ -67,73 +57,85 @@ if "clip_paths" not in st.session_state:
     st.session_state.clip_paths = []
 
 def process_video():
-    ensure_ffmpeg()
-    tmpdir = Path(tempfile.mkdtemp(prefix="scene_slicer_ui_"))
     try:
-        # Source
-        if input_mode == "Local File":
-            if not uploaded_file:
-                st.error("Please upload a local video file.")
+        slicer.ensure_ffmpeg()
+    except Exception as e:
+        st.error(f"ffmpeg check failed: {e}")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="scene_slicer_ui_") as tmp:
+        tmpdir = Path(tmp)
+        video = None          # ensure defined in outer scope
+        try:
+            # Source
+            if input_mode == "Local File":
+                if not uploaded_file:
+                    st.error("Please upload a local video file.")
+                    return
+                tmp_video = tmpdir / uploaded_file.name
+                with open(tmp_video, "wb") as f:
+                    f.write(uploaded_file.read())
+                video_path = tmp_video
+                video_id = "localfile"
+            else:
+                if not url.strip():
+                    st.error("Please enter a YouTube URL.")
+                    return
+                st.write("**[1/3] Downloading…**")
+                video_path, video_id = slicer.download_youtube(url.strip(), tmpdir, cookies_from_browser=cookies_from_browser)
+                st.success(f"Downloaded: {video_path.name}")
+
+            st.write("**[2/3] Detecting scenes…**")
+            scenes, video = slicer.detect_scenes(
+                video_path=video_path,
+                detector=detector,
+                threshold=threshold,
+                start=start,
+                max_duration=max_duration,
+                min_scene_len=min_export_len
+            )
+            st.info(f"Detected **{len(scenes)}** raw scenes")
+
+            base_out = out_root / video_id
+            scenes_dir = base_out / "scenes"
+            base_out.mkdir(parents=True, exist_ok=True)
+
+            st.write("**[3/3] Exporting clips…**")
+            outputs, kept_scenes = slicer.export_scenes_ffmpeg(
+                video_path,
+                scenes,
+                scenes_dir,
+                prefix="scene_",
+                dry_run=do_dry_run,
+                min_export_len=min_export_len,
+            )
+
+            if not do_dry_run:
+                manifest_csv = slicer.write_manifest(kept_scenes, base_out, base_prefix="scene_")
+
+                # Load manifest via pandas
+                df = pd.read_csv(manifest_csv)  
+                st.session_state.manifest_df = df
+
+            st.session_state.clip_paths = outputs if not do_dry_run else []
+            st.session_state.last_output_dir = base_out
+            st.session_state.video_id = video_id
+
+            st.success(f"Done! Exported {len(outputs)} scenes ≥ {min_export_len:.2f}s.")
+        finally:
+            # Best-effort: release scenedetect handles, delete reference, run GC and allow a short delay
+            try:
+                slicer.close_video(video)
+            except Exception as e:
+                st.error(f"Error closing video: {e}")
                 return
-            tmp_video = tmpdir / uploaded_file.name
-            with open(tmp_video, "wb") as f:
-                f.write(uploaded_file.read())
-            video_path = tmp_video
-            video_id = "localfile"
-        else:
-            if not url.strip():
-                st.error("Please enter a YouTube URL.")
-                return
-            st.write("**[1/3] Downloading…**")
-            video_path, video_id = download_youtube(url.strip(), tmpdir, cookies_from_browser=cookies_from_browser)
-            st.success(f"Downloaded: {video_path.name}")
-
-        st.write("**[2/3] Detecting scenes…**")
-        scenes, video = detect_scenes(
-            video_path=video_path,
-            detector=detector,
-            threshold=threshold,
-            start=start,
-            max_duration=max_duration,
-            min_scene_len=min_export_len
-        )
-        st.info(f"Detected **{len(scenes)}** raw scenes")
-
-        base_out = out_root / video_id
-        scenes_dir = base_out / "scenes"
-        base_out.mkdir(parents=True, exist_ok=True)
-
-        st.write("**[3/3] Exporting clips…**")
-        outputs, kept_scenes = export_scenes_ffmpeg(
-            video_path,
-            scenes,
-            scenes_dir,
-            prefix="scene_",
-            dry_run=do_dry_run,
-            min_export_len=min_export_len,   # <- filter applied here
-        )
-
-        if not do_dry_run:
-            manifest_csv = write_manifest(kept_scenes, base_out, base_prefix="scene_")
-
-            # Load manifest
-            import csv
-            rows = []
-            with open(manifest_csv, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                headers = next(reader)
-                for row in reader:
-                    rows.append(row)
-            df = pd.DataFrame(rows, columns=["scene_number", "start_sec", "end_sec", "duration_sec", "output_file"])
-            st.session_state.manifest_df = df
-
-        st.session_state.clip_paths = outputs if not do_dry_run else []
-        st.session_state.last_output_dir = base_out
-        st.session_state.video_id = video_id
-
-        st.success(f"Done! Exported {len(outputs)} scenes ≥ {min_export_len:.2f}s.")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+            try:
+                # remove Python reference and collect so OS handles get closed
+                del video
+            except Exception as e:
+                st.error(f"Error deleting video reference: {e}")
+            gc.collect()
+            time.sleep(0.25)
 
 if run_btn:
     with st.spinner("Processing…"):
