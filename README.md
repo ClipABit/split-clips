@@ -60,46 +60,6 @@ docker run --rm -v "$PWD/outputs:/app/outputs" scene-slicer \
   python scene_slicer.py "YOUTUBE_URL_HERE" -o outputs --threshold 27
 ```
 
----
-
-## Repo Structure
-```
-scene-slicer/
-  ├─ scene_slicer.py
-  ├─ requirements.txt
-  ├─ Dockerfile
-  ├─ README.md
-  ├─ LICENSE
-  └─ .gitignore
-```
-
-## Notes
-- For noisy music videos, try `--threshold 32` or `--detector adaptive`.
-- For very fast cuts, **lower** threshold (e.g., `--threshold 22`) and `--min-scene-len 0.3`.
-- You can re-run on a **local file** instead of a URL as well.
-
-
----
-
-## Troubleshooting
-
-**YouTube SABR / nsig warnings**  
-If you see warnings like *"nsig extraction failed"* or *"YouTube is forcing SABR streaming"*:
-- Update yt-dlp to the latest: `pip install -U yt-dlp` (or `yt-dlp -U` if installed globally).
-- The tool now tries alternate player clients (`android`, `tvhtml5`, then `web`) to avoid SABR-restricted formats.
-- Optionally use your browser cookies to access formats available to your account:
-  ```bash
-  python scene_slicer.py "URL" --cookies-from-browser chrome
-  # or a specific profile:
-  python scene_slicer.py "URL" --cookies-from-browser "chrome:Profile 1"
-  ```
-
-**`ffmpeg` not found**  
-Ensure ffmpeg is installed and on PATH. On Windows, open a new terminal after updating PATH.
-
-
----
-
 ## Streamlit UI
 
 Launch a simple web UI locally:
